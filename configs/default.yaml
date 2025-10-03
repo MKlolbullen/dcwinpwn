@@ -1,0 +1,17 @@
+limits:
+  per_host_qps: 1.5
+  per_proto_qps:
+    ldap: 10
+    smb: 1.2
+    mssql: 0.8
+cache_ttl_sec:
+  discovery: 1200
+  ldap: 1200
+  smb: 600
+
+ports:
+  windows: [53,88,135,389,445,636,3268,3269,5985,5986,1433,3389]
+  unix: [22,53,88,389,636]
+
+nse:
+  enabled: ["discovery/nse/ad_dc_detect.nse","smb-os-discovery","ldap-rootdse"]
