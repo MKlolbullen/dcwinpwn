@@ -1,0 +1,23 @@
+[project]
+name = "linWinPwn-next"
+version = "0.1.0"
+description = "Core backend, discovery, and API for linWinPwn with graph-ready outputs"
+requires-python = ">=3.13"
+dependencies = [
+    "fastapi",
+    "uvicorn[standard]",
+    "pydantic",
+    "networkx",
+    "impacket",
+    "ldap3",
+    "python-nmap",
+    "requests",
+    "typer",
+    "rich",
+    "neo4j",
+    "netexec",
+    "certipy-ad"
+]
+
+[tool.ruff]
+line-length = 100
